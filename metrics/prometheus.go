@@ -17,10 +17,13 @@ package metrics
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
+	//	"strconv"
 
 	info "github.com/google/cadvisor/info/v1"
 
+	"github.com/fsouza/go-dockerclient"
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -78,13 +81,19 @@ type PrometheusCollector struct {
 	errors                prometheus.Gauge
 	containerMetrics      []containerMetric
 	containerNameToLabels ContainerNameToLabelsFunc
+	client                *docker.Client
 }
 
 // NewPrometheusCollector returns a new PrometheusCollector.
 func NewPrometheusCollector(infoProvider infoProvider, f ContainerNameToLabelsFunc) *PrometheusCollector {
+	dockerClient, err := docker.NewClient("unix:///var/run/docker.sock")
+	if err != nil {
+		fmt.Errorf("Cant't create docker client. %v", err)
+	}
 	c := &PrometheusCollector{
 		infoProvider:          infoProvider,
 		containerNameToLabels: f,
+		client:                dockerClient,
 		errors: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "container",
 			Name:      "scrape_error",
@@ -500,12 +509,15 @@ func (c *PrometheusCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *PrometheusCollector) collectContainersInfo(ch chan<- prometheus.Metric) {
-	containers, err := c.infoProvider.SubcontainersInfo("/", &info.ContainerInfoRequest{NumStats: 1})
+	containers, err := c.infoProvider.SubcontainersInfo("/", &info.ContainerInfoRequest{NumStats: 2})
 	if err != nil {
 		c.errors.Set(1)
 		glog.Warningf("Couldn't get containers: %s", err)
 		return
 	}
+
+	fmt.Printf("collectContainersInfo called! \n")
+
 	for _, container := range containers {
 		baseLabels := []string{"id"}
 		id := container.Name
@@ -514,58 +526,88 @@ func (c *PrometheusCollector) collectContainersInfo(ch chan<- prometheus.Metric)
 			name = container.Aliases[0]
 			baseLabels = append(baseLabels, "name")
 		}
-		image := container.Spec.Image
-		if len(image) > 0 {
-			baseLabels = append(baseLabels, "image")
-		}
-		baseLabelValues := []string{id, name, image}[:len(baseLabels)]
 
-		if c.containerNameToLabels != nil {
-			newLabels := c.containerNameToLabels(name)
-			for k, v := range newLabels {
-				baseLabels = append(baseLabels, sanitizeLabelName(k))
-				baseLabelValues = append(baseLabelValues, v)
+		if strings.Contains(name, "mesos") {
+
+			image := container.Spec.Image
+			if len(image) > 0 {
+				baseLabels = append(baseLabels, "image")
 			}
-		}
+			baseLabelValues := []string{id, name, image}[:len(baseLabels)]
 
-		for k, v := range container.Spec.Labels {
-			baseLabels = append(baseLabels, sanitizeLabelName(k))
-			baseLabelValues = append(baseLabelValues, v)
-		}
-		for k, v := range container.Spec.Envs {
-			baseLabels = append(baseLabels, sanitizeLabelName(k))
-			baseLabelValues = append(baseLabelValues, v)
-		}
+			fmt.Printf("image: %s \n", image)
 
-		// Container spec
-		desc := prometheus.NewDesc("container_start_time_seconds", "Start time of the container since unix epoch in seconds.", baseLabels, nil)
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.CreationTime.Unix()), baseLabelValues...)
+			if strings.Contains(image, "linker_es") {
+				c.FetchElasticSerachInfo(INDEX_MEMORY_USAGE, "Usage of Memory on the Docker instance.", container, ch)
+			} else if strings.Contains(image, "stack") {
+				c.GetLinkerUDPMonitorInfo(INDEX_NETWORK_TRANSMIT_PACKAGE_NUMBER, "NETWORK TRANSMIT PACKAGE NUMBER NETWORK_TRANSMIT_PACKAGE_NUMBER", "8000", "udp", "hssNumber", "transmitPackageNumber", container, ch)
+			} else if strings.Contains(image, "gw_monitor") {
+				c.GetGwMonitorInfo(INDEX_GW_CONNECTIONS, "Usage of PGW/SGW instance.", container, ch)
+			} else if strings.Contains(image, "linker_pgw") || strings.Contains(image, "linker_sgw") {
 
-		if container.Spec.HasCpu {
-			desc = prometheus.NewDesc("container_spec_cpu_period", "CPU period of the container.", baseLabels, nil)
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.Cpu.Period), baseLabelValues...)
-			if container.Spec.Cpu.Quota != 0 {
-				desc = prometheus.NewDesc("container_spec_cpu_quota", "CPU quota of the container.", baseLabels, nil)
-				ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.Cpu.Quota), baseLabelValues...)
+				stats := container.Stats[0]
+				for _, cm := range c.containerMetrics {
+					desc := cm.desc(baseLabels)
+					for _, metricValue := range cm.getValues(stats) {
+						ch <- prometheus.MustNewConstMetric(desc, cm.valueType, float64(metricValue.value), append(baseLabelValues, metricValue.labels...)...)
+					}
+				}
+
+				// Add new Metric for caluate memory usage.
+				c.GetContainerInfo(INDEX_MEMORY_USAGE, "Usage of Memory on the Docker instance which to be averaged.", container, ch, stats, nil, -1)
+
+				// Add new Metric for get networks adapter receive bytes by second.
+				if len(container.Stats) >= 2 {
+					c.GetContainerInfo(INDEX_CPU_USAGE, "Usage of CPU on the Docker instance which to be averaged.", container, ch, container.Stats[len(container.Stats)-1], container.Stats[len(container.Stats)-2], -1)
+				} else {
+					c.GetContainerInfo(INDEX_CPU_USAGE, "Usage of CPU on the Docker instance which to be averaged.", container, ch, stats, nil, -1)
+				}
+			} else {
+				// normal image
+				if c.containerNameToLabels != nil {
+					newLabels := c.containerNameToLabels(name)
+					for k, v := range newLabels {
+						baseLabels = append(baseLabels, sanitizeLabelName(k))
+						baseLabelValues = append(baseLabelValues, v)
+					}
+				}
+
+				// Container spec
+				desc := prometheus.NewDesc("container_start_time_seconds", "Start time of the container since unix epoch in seconds.", baseLabels, nil)
+				ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.CreationTime.Unix()), baseLabelValues...)
+
+				if container.Spec.HasCpu {
+					desc := prometheus.NewDesc("container_spec_cpu_shares", "CPU share of the container.", baseLabels, nil)
+					ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.Cpu.Limit), baseLabelValues...)
+				}
+
+				if container.Spec.HasMemory {
+					desc := prometheus.NewDesc("container_spec_memory_limit_bytes", "Memory limit for the container.", baseLabels, nil)
+					ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, specMemoryValue(container.Spec.Memory.Limit), baseLabelValues...)
+					desc = prometheus.NewDesc("container_spec_memory_swap_limit_bytes", "Memory swap limit for the container.", baseLabels, nil)
+					ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, specMemoryValue(container.Spec.Memory.SwapLimit), baseLabelValues...)
+				}
+
+				// Now for the actual metrics
+				stats := container.Stats[0]
+				for _, cm := range c.containerMetrics {
+					desc := cm.desc(baseLabels)
+					for _, metricValue := range cm.getValues(stats) {
+						ch <- prometheus.MustNewConstMetric(desc, cm.valueType, float64(metricValue.value), append(baseLabelValues, metricValue.labels...)...)
+					}
+				}
+
+				// Add new Metric for caluate memory usage.
+				c.CalLinkerIndexs(INDEX_MEMORY_USAGE, "Usage of Memory on the Docker instance.", container, ch, stats, nil, -1)
+
+				if len(container.Stats) >= 2 {
+					c.CalLinkerIndexs(INDEX_CPU_USAGE, "Usage of CPU on the Docker instance.", container, ch, container.Stats[len(container.Stats)-1], container.Stats[len(container.Stats)-2], -1)
+				} else {
+					c.CalLinkerIndexs(INDEX_CPU_USAGE, "Usage of CPU on the Docker instance.", container, ch, stats, nil, -1)
+				}
+
 			}
-			desc := prometheus.NewDesc("container_spec_cpu_shares", "CPU share of the container.", baseLabels, nil)
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(container.Spec.Cpu.Limit), baseLabelValues...)
 
-		}
-		if container.Spec.HasMemory {
-			desc := prometheus.NewDesc("container_spec_memory_limit_bytes", "Memory limit for the container.", baseLabels, nil)
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, specMemoryValue(container.Spec.Memory.Limit), baseLabelValues...)
-			desc = prometheus.NewDesc("container_spec_memory_swap_limit_bytes", "Memory swap limit for the container.", baseLabels, nil)
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, specMemoryValue(container.Spec.Memory.SwapLimit), baseLabelValues...)
-		}
-
-		// Now for the actual metrics
-		stats := container.Stats[0]
-		for _, cm := range c.containerMetrics {
-			desc := cm.desc(baseLabels)
-			for _, metricValue := range cm.getValues(stats) {
-				ch <- prometheus.MustNewConstMetric(desc, cm.valueType, float64(metricValue.value), append(baseLabelValues, metricValue.labels...)...)
-			}
 		}
 	}
 }
@@ -608,4 +650,10 @@ var invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 // client_label.LabelNameRE with an underscore.
 func sanitizeLabelName(name string) string {
 	return invalidLabelCharRE.ReplaceAllString(name, "_")
+}
+
+func parseIpAddr(ipaddr string) (ip string) {
+	array := strings.Split(ipaddr, "/")
+	ip = array[0]
+	return
 }

@@ -73,6 +73,11 @@ func handleRequest(supportedApiVersions map[string]ApiVersion, m manager.Manager
 
 	request := r.URL.Path
 
+	if strings.HasPrefix(request, linkerApiPrefix) {
+		HandleLinkerRequest(w, r)
+		return nil
+	}
+
 	const apiPrefix = "/api"
 	if !strings.HasPrefix(request, apiPrefix) {
 		return fmt.Errorf("incomplete API request %q", request)
