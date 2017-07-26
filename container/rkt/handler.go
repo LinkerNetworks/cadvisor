@@ -18,7 +18,6 @@ package rkt
 import (
 	"fmt"
 	"os"
-	"time"
 
 	rktapi "github.com/coreos/rkt/api/v1alpha"
 	"github.com/google/cadvisor/container"
@@ -84,7 +83,7 @@ func newRktContainerHandler(name string, rktClient rktapi.PublicAPIClient, rktPa
 		return nil, fmt.Errorf("this should be impossible!, new handler failing, but factory allowed, name = %s", name)
 	}
 
-	//rktnetes uses containerID: rkt://fff40827-b994-4e3a-8f88-6427c2c8a5ac:nginx
+	// rktnetes uses containerID: rkt://fff40827-b994-4e3a-8f88-6427c2c8a5ac:nginx
 	if parsed.Container == "" {
 		isPod = true
 		aliases = append(aliases, "rkt://"+parsed.Pod)
@@ -99,20 +98,19 @@ func newRktContainerHandler(name string, rktClient rktapi.PublicAPIClient, rktPa
 	})
 	if err != nil {
 		return nil, err
-	} else {
-		var annotations []*rktapi.KeyValue
-		if parsed.Container == "" {
-			pid = int(resp.Pod.Pid)
-			apiPod = resp.Pod
-			annotations = resp.Pod.Annotations
-		} else {
-			var ok bool
-			if annotations, ok = findAnnotations(resp.Pod.Apps, parsed.Container); !ok {
-				glog.Warningf("couldn't find application in Pod matching %v", parsed.Container)
-			}
-		}
-		labels = createLabels(annotations)
 	}
+	annotations := resp.Pod.Annotations
+	if parsed.Container != "" { // As not empty string, an App container
+		if contAnnotations, ok := findAnnotations(resp.Pod.Apps, parsed.Container); !ok {
+			glog.Warningf("couldn't find app %v in pod", parsed.Container)
+		} else {
+			annotations = append(annotations, contAnnotations...)
+		}
+	} else { // The Pod container
+		pid = int(resp.Pod.Pid)
+		apiPod = resp.Pod
+	}
+	labels = createLabels(annotations)
 
 	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems.MountPoints, name)
 
@@ -151,7 +149,7 @@ func newRktContainerHandler(name string, rktClient rktapi.PublicAPIClient, rktPa
 	}
 
 	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
-		handler.fsHandler = common.NewFsHandler(time.Minute, rootfsStorageDir, "", fsInfo)
+		handler.fsHandler = common.NewFsHandler(common.DefaultPeriod, rootfsStorageDir, "", fsInfo)
 	}
 
 	return handler, nil
@@ -195,10 +193,24 @@ func (handler *rktContainerHandler) Cleanup() {
 func (handler *rktContainerHandler) GetSpec() (info.ContainerSpec, error) {
 	hasNetwork := handler.hasNetwork && !handler.ignoreMetrics.Has(container.NetworkUsageMetrics)
 	hasFilesystem := !handler.ignoreMetrics.Has(container.DiskUsageMetrics)
-	return common.GetSpec(handler.cgroupPaths, handler.machineInfoFactory, hasNetwork, hasFilesystem)
+
+	spec, err := common.GetSpec(handler.cgroupPaths, handler.machineInfoFactory, hasNetwork, hasFilesystem)
+
+	spec.Labels = handler.labels
+
+	return spec, err
 }
 
 func (handler *rktContainerHandler) getFsStats(stats *info.ContainerStats) error {
+	mi, err := handler.machineInfoFactory.GetMachineInfo()
+	if err != nil {
+		return err
+	}
+
+	if !handler.ignoreMetrics.Has(container.DiskIOMetrics) {
+		common.AssignDeviceNamesToDiskStats((*common.MachineInfoNamer)(mi), &stats.DiskIo)
+	}
+
 	if handler.ignoreMetrics.Has(container.DiskUsageMetrics) {
 		return nil
 	}
@@ -208,10 +220,6 @@ func (handler *rktContainerHandler) getFsStats(stats *info.ContainerStats) error
 		return err
 	}
 
-	mi, err := handler.machineInfoFactory.GetMachineInfo()
-	if err != nil {
-		return err
-	}
 	var limit uint64 = 0
 
 	// Use capacity as limit.
@@ -224,7 +232,10 @@ func (handler *rktContainerHandler) getFsStats(stats *info.ContainerStats) error
 
 	fsStat := info.FsStats{Device: deviceInfo.Device, Limit: limit}
 
-	fsStat.BaseUsage, fsStat.Usage = handler.fsHandler.Usage()
+	usage := handler.fsHandler.Usage()
+	fsStat.BaseUsage = usage.BaseUsageBytes
+	fsStat.Usage = usage.TotalUsageBytes
+	fsStat.Inodes = usage.InodeUsage
 
 	stats.Filesystem = append(stats.Filesystem, fsStat)
 
@@ -244,6 +255,21 @@ func (handler *rktContainerHandler) GetStats() (*info.ContainerStats, error) {
 	}
 
 	return stats, nil
+}
+
+func (self *rktContainerHandler) GetContainerIPAddress() string {
+	// attempt to return the ip address of the pod
+	// if a specific ip address of the pod could not be determined, return the system ip address
+	if self.isPod && len(self.apiPod.Networks) > 0 {
+		address := self.apiPod.Networks[0].Ipv4
+		if address != "" {
+			return address
+		} else {
+			return self.apiPod.Networks[0].Ipv6
+		}
+	} else {
+		return "127.0.0.1"
+	}
 }
 
 func (handler *rktContainerHandler) GetCgroupPath(resource string) (string, error) {
@@ -266,15 +292,10 @@ func (handler *rktContainerHandler) ListProcesses(listType container.ListType) (
 	return libcontainer.GetProcesses(handler.cgroupManager)
 }
 
-func (handler *rktContainerHandler) WatchSubcontainers(events chan container.SubcontainerEvent) error {
-	return fmt.Errorf("watch is unimplemented in the Rkt container driver")
-}
-
-func (handler *rktContainerHandler) StopWatchingSubcontainers() error {
-	// No-op for Rkt driver.
-	return nil
-}
-
 func (handler *rktContainerHandler) Exists() bool {
 	return common.CgroupExists(handler.cgroupPaths)
+}
+
+func (handler *rktContainerHandler) Type() container.ContainerType {
+	return container.ContainerTypeRkt
 }

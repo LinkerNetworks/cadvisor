@@ -32,6 +32,8 @@ import (
 	"github.com/google/cadvisor/utils/sysfs"
 	"github.com/google/cadvisor/version"
 
+	"crypto/tls"
+
 	"github.com/golang/glog"
 )
 
@@ -53,16 +55,23 @@ var allowDynamicHousekeeping = flag.Bool("allow_dynamic_housekeeping", true, "Wh
 
 var enableProfiling = flag.Bool("profiling", false, "Enable profiling via web interface host:port/debug/pprof/")
 
+var collectorCert = flag.String("collector_cert", "", "Collector's certificate, exposed to endpoints for certificate based authentication.")
+var collectorKey = flag.String("collector_key", "", "Key for the collector's certificate")
+
 var (
 	// Metrics to be ignored.
 	// Tcp metrics are ignored by default.
-	ignoreMetrics metricSetValue = metricSetValue{container.MetricSet{container.NetworkTcpUsageMetrics: struct{}{}}}
+	ignoreMetrics metricSetValue = metricSetValue{container.MetricSet{
+		container.NetworkTcpUsageMetrics: struct{}{},
+		container.NetworkUdpUsageMetrics: struct{}{},
+	}}
 
 	// List of metrics that can be ignored.
 	ignoreWhitelist = container.MetricSet{
 		container.DiskUsageMetrics:       struct{}{},
 		container.NetworkUsageMetrics:    struct{}{},
 		container.NetworkTcpUsageMetrics: struct{}{},
+		container.NetworkUdpUsageMetrics: struct{}{},
 	}
 )
 
@@ -94,7 +103,7 @@ func (ml *metricSetValue) Set(value string) error {
 }
 
 func init() {
-	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of `metrics` to be disabled. Options are 'disk', 'network', 'tcp'. Note: tcp is disabled by default due to high CPU usage.")
+	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of `metrics` to be disabled. Options are 'disk', 'network', 'tcp', 'udp'. Note: tcp and udp are disabled by default due to high CPU usage.")
 }
 
 func main() {
@@ -113,12 +122,11 @@ func main() {
 		glog.Fatalf("Failed to initialize storage driver: %s", err)
 	}
 
-	sysFs, err := sysfs.NewRealSysFs()
-	if err != nil {
-		glog.Fatalf("Failed to create a system interface: %s", err)
-	}
+	sysFs := sysfs.NewRealSysFs()
 
-	containerManager, err := manager.New(memoryStorage, sysFs, *maxHousekeepingInterval, *allowDynamicHousekeeping, ignoreMetrics.MetricSet)
+	collectorHttpClient := createCollectorHttpClient(*collectorCert, *collectorKey)
+
+	containerManager, err := manager.New(memoryStorage, sysFs, *maxHousekeepingInterval, *allowDynamicHousekeeping, ignoreMetrics.MetricSet, &collectorHttpClient)
 	if err != nil {
 		glog.Fatalf("Failed to create a Container Manager: %s", err)
 	}
@@ -185,4 +193,30 @@ func installSignalHandler(containerManager manager.Manager) {
 		glog.Infof("Exiting given signal: %v", sig)
 		os.Exit(0)
 	}()
+}
+
+func createCollectorHttpClient(collectorCert, collectorKey string) http.Client {
+	//Enable accessing insecure endpoints. We should be able to access metrics from any endpoint
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	if collectorCert != "" {
+		if collectorKey == "" {
+			glog.Fatal("The collector_key value must be specified if the collector_cert value is set.")
+		}
+		cert, err := tls.LoadX509KeyPair(collectorCert, collectorKey)
+		if err != nil {
+			glog.Fatalf("Failed to use the collector certificate and key: %s", err)
+		}
+
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		tlsConfig.BuildNameToCertificate()
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	return http.Client{Transport: transport}
 }
