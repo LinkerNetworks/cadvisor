@@ -1,6 +1,6 @@
 {
 	"ImportPath": "github.com/google/cadvisor",
-	"GoVersion": "go1.6",
+	"GoVersion": "go1.8",
 	"GodepVersion": "v79",
 	"Packages": [
 		"./..."
@@ -632,6 +632,14 @@
 		{
 			"ImportPath": "github.com/prometheus/procfs/xfs",
 			"Rev": "1e2146578273cef808354faa16a1922e0b5d6b2f"
-		}
+		},
+		{
+                        "ImportPath": "github.com/fsouza/go-dockerclient",
+                        "Rev": "1d4f4ae73768d3ca16a6fb964694f58dc5eba601"
+                },
+		{
+                        "ImportPath": "github.com/jmoiron/jsonq",
+                        "Rev": "e874b168d07ecc7808bc950a17998a8aa3141d82"
+                }
 	]
 }
