@@ -129,7 +129,7 @@ func ParseDockerNameString(source string) (output string) {
 func ExecCommand(input string) (output string, errput string, err error) {
 	var retoutput string
 	var reterrput string
-	cmd := exec.Command("/bin/bash", "-c", input)
+	cmd := exec.Command("/bin/sh", "-c", input)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", "", err
